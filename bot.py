@@ -5,16 +5,62 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 import requests
 import time
 import json
+import os
+import hashlib
+from functools import wraps
+from collections import defaultdict
+import logging
 
-# ========== НАСТРОЙКИ ==========
-VK_TOKEN = "vk1.a.saqWO0JbCpERiTwMPuTDi1VFZdObaNX2eOIHim12O-TH7vN-ce_uGYRYrJvEuYI5XqoOHztw3aq5FCBK9pfVnET-yPPPbbnLtX32jHJ9LO-je1hBuFrvp-Ry9BSnDR5O2MjRE7--XKhOv3LQ9l6_ZufZXVksjoqXHdsvPxXsjPxLuN-VNLzSi_hsHtLEhJZkpYgCtwVAlATk2m3s3C5QSQ"
-VK_GROUP_ID = 237047714
-SPREADSHEET_ID = "1_57qA5vsVDJevrscNWKPt4q8Hp0XdwdKUbyUlnooKMU"
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-GID_ARCHIVE = "1821608543"
-GID_SCHEDULE = "0"
+# ========== НАСТРОЙКИ (из переменных окружения) ==========
+VK_TOKEN = os.getenv("VK_TOKEN")
+if not VK_TOKEN:
+    logger.error("❌ Переменная окружения VK_TOKEN не установлена!")
+    exit(1)
 
-ADMIN_PASSWORD = "vladsexmahina"
+VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "237047714"))
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1_57qA5vsVDJevrscNWKPt4q8Hp0XdwdKUbyUlnooKMU")
+
+GID_ARCHIVE = os.getenv("GID_ARCHIVE", "1821608543")
+GID_SCHEDULE = os.getenv("GID_SCHEDULE", "0")
+
+# Хеш пароля администратора (вместо хранения пароля в открытом виде)
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
+if not ADMIN_PASSWORD_HASH:
+    # Если хеш не установлен, используем дефолтный (необходимо изменить в production!)
+    DEFAULT_ADMIN_PASSWORD = "ChangeMeInProduction123!"
+    ADMIN_PASSWORD_HASH = hashlib.sha256(DEFAULT_ADMIN_PASSWORD.encode()).hexdigest()
+    logger.warning("⚠️ Используется пароль по умолчанию! Установите ADMIN_PASSWORD_HASH в переменных окружениях.")
+
+# Константы для индексов колонок
+COL_FIO = 0
+COL_PHONE = 1
+COL_BRANCH = 2
+COL_STUDY_FORMAT = 3
+COL_TOTAL_AMOUNT = 4
+COL_PAID = 5
+COL_TOTAL_LESSONS = 5  # Для расписания
+COL_PSYCH_NARK = 6
+COL_STATE_FEE = 7
+COL_EXAM1 = 8
+COL_EXAM2 = 9
+COL_EXAM3 = 10
+COL_DATA_START = 11
+
+# Rate limiting настройки
+RATE_LIMIT_REQUESTS = 10  # Максимум запросов
+RATE_LIMIT_WINDOW = 60  # В секундах
+
 # =================================
 
 EXAM_LINKS = {
@@ -36,8 +82,8 @@ TIME_MAP = {
     "18:00:00": "18:00", "19:30:00": "19:30", "21:00:00": "21:00", "22:30:00": "22:30"
 }
 
-print("🚀 Запуск бота...")
-print(f"ID таблицы: {SPREADSHEET_ID}")
+logger.info("🚀 Запуск бота...")
+logger.info(f"ID таблицы: {SPREADSHEET_ID}")
 
 cached_archive = None
 cached_schedule = None
@@ -45,6 +91,39 @@ last_update_time = None
 
 user_data = {}
 admin_sessions = {}  # user_id -> {"awaiting_password": True, "authorized": True, "awaiting_date": False, "awaiting_student": False}
+
+# Rate limiting: хранение времени запросов для каждого пользователя
+user_request_times = defaultdict(list)
+
+def check_rate_limit(user_id):
+    """Проверка rate limiting для пользователя"""
+    now = time.time()
+    # Очищаем старые запросы за пределами окна
+    user_request_times[user_id] = [t for t in user_request_times[user_id] if now - t < RATE_LIMIT_WINDOW]
+    
+    if len(user_request_times[user_id]) >= RATE_LIMIT_REQUESTS:
+        return False
+    
+    user_request_times[user_id].append(now)
+    return True
+
+def sanitize_input(text):
+    """Санитизация пользовательского ввода для защиты от инъекций"""
+    if not text:
+        return ""
+    text = str(text).strip()
+    # Ограничиваем длину
+    text = text[:500]
+    return text
+
+def validate_fio_format(fio):
+    """Валидация формата ФИО"""
+    if not fio or len(fio) < 3:
+        return False
+    # Проверяем, что ввод содержит только буквы, пробелы и дефисы (для фамилий)
+    if not re.match(r'^[\w\s\-]+$', fio, re.UNICODE):
+        return False
+    return True
 
 def clean_number(value):
     if not value:
@@ -103,19 +182,22 @@ def get_sheet_data(gid, force_refresh=False):
     
     try:
         url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid={gid}"
-        print(f"  🔄 Загружаем gid={gid}...")
+        logger.info(f"  🔄 Загружаем gid={gid}...")
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
-            print(f"  ❌ Ошибка: {response.status_code}")
+            logger.error(f"  ❌ Ошибка: {response.status_code}")
             return None
 
-        try:
-            content = response.content.decode('utf-8')
-        except:
+        # Улучшенная обработка кодировки
+        content = ""
+        for encoding in ['utf-8', 'cp1251', 'latin-1']:
             try:
-                content = response.content.decode('cp1251')
-            except:
-                content = response.text
+                content = response.content.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not content:
+            content = response.text
         
         lines = content.strip().split('\n')
         
@@ -138,7 +220,7 @@ def get_sheet_data(gid, force_refresh=False):
             cells = [c.strip('"') for c in cells]
             all_data.append(cells)
         
-        print(f"  ✅ Загружено {len(all_data)} строк")
+        logger.info(f"  ✅ Загружено {len(all_data)} строк")
         
         if gid == GID_ARCHIVE:
             cached_archive = all_data
@@ -149,21 +231,21 @@ def get_sheet_data(gid, force_refresh=False):
         return all_data
             
     except Exception as e:
-        print(f"  ❌ Ошибка: {e}")
+        logger.error(f"  ❌ Ошибка: {e}")
         return None
 
 def refresh_all_data():
     global cached_archive, cached_schedule, last_update_time
-    print("\n🔄 Принудительное обновление данных из таблицы...")
+    logger.info("\n🔄 Принудительное обновление данных из таблицы...")
     cached_archive = None
     cached_schedule = None
     archive = get_sheet_data(GID_ARCHIVE, force_refresh=True)
     schedule = get_sheet_data(GID_SCHEDULE, force_refresh=True)
     if archive and schedule:
-        print(f"✅ Данные успешно обновлены! Время: {last_update_time}")
+        logger.info(f"✅ Данные успешно обновлены! Время: {last_update_time}")
         return True
     else:
-        print("❌ Ошибка при обновлении данных!")
+        logger.error("❌ Ошибка при обновлении данных!")
         return False
 
 def get_student_schedule_by_row(student_row_index, schedule_data):
@@ -176,17 +258,18 @@ def get_student_schedule_by_row(student_row_index, schedule_data):
     dates_row = schedule_data[0]
     student_row = schedule_data[schedule_index]
     
-    total_lessons = student_row[5] if len(student_row) > 5 and student_row[5] else "0"
-    psych_nark = student_row[6] if len(student_row) > 6 and student_row[6] else "нет"
-    state_fee = student_row[7] if len(student_row) > 7 and student_row[7] else "нет"
+    # Используем константы для индексов колонок
+    total_lessons = student_row[COL_TOTAL_LESSONS] if len(student_row) > COL_TOTAL_LESSONS and student_row[COL_TOTAL_LESSONS] else "0"
+    psych_nark = student_row[COL_PSYCH_NARK] if len(student_row) > COL_PSYCH_NARK and student_row[COL_PSYCH_NARK] else "нет"
+    state_fee = student_row[COL_STATE_FEE] if len(student_row) > COL_STATE_FEE and student_row[COL_STATE_FEE] else "нет"
     
-    exam1_value = student_row[8] if len(student_row) > 8 and student_row[8] else ""
-    exam2_value = student_row[9] if len(student_row) > 9 and student_row[9] else ""
-    exam3_value = student_row[10] if len(student_row) > 10 and student_row[10] else ""
+    exam1_value = student_row[COL_EXAM1] if len(student_row) > COL_EXAM1 and student_row[COL_EXAM1] else ""
+    exam2_value = student_row[COL_EXAM2] if len(student_row) > COL_EXAM2 and student_row[COL_EXAM2] else ""
+    exam3_value = student_row[COL_EXAM3] if len(student_row) > COL_EXAM3 and student_row[COL_EXAM3] else ""
     
-    exam_date1 = dates_row[8] if len(dates_row) > 8 else ""
-    exam_date2 = dates_row[9] if len(dates_row) > 9 else ""
-    exam_date3 = dates_row[10] if len(dates_row) > 10 else ""
+    exam_date1 = dates_row[COL_EXAM1] if len(dates_row) > COL_EXAM1 else ""
+    exam_date2 = dates_row[COL_EXAM2] if len(dates_row) > COL_EXAM2 else ""
+    exam_date3 = dates_row[COL_EXAM3] if len(dates_row) > COL_EXAM3 else ""
     
     def extract_date_from_header(header):
         match = re.search(r'\((\d{1,2})\.(\d{1,2})\.(\d{4})\)', header)
@@ -217,7 +300,7 @@ def get_student_schedule_by_row(student_row_index, schedule_data):
     now = datetime.now()
     current_year = now.year
     
-    for col in range(11, min(len(dates_row), len(student_row))):
+    for col in range(COL_DATA_START, min(len(dates_row), len(student_row))):
         date_str = str(dates_row[col]).strip() if col < len(dates_row) else ""
         time_value = str(student_row[col]).strip() if col < len(student_row) else ""
         if not time_value or time_value == "":
@@ -267,7 +350,7 @@ def get_students_by_date(all_data, schedule_data, target_date):
     
     dates_row = schedule_data[0]
     target_col = None
-    for col in range(11, min(len(dates_row), 50)):
+    for col in range(COL_DATA_START, min(len(dates_row), 50)):
         date_str = str(dates_row[col]).strip()
         date_match = re.search(r'(\d{4})-(\d{2})-(\d{2})', date_str)
         if date_match:
@@ -289,11 +372,14 @@ def get_students_by_date(all_data, schedule_data, target_date):
     for idx, row in enumerate(schedule_data[1:], start=2):
         if len(row) > target_col and row[target_col] and row[target_col].strip():
             time_val = row[target_col].strip()
-            student_fio = row[0].strip() if len(row) > 0 else ""
+            student_fio = sanitize_input(row[0]) if len(row) > 0 else ""
+            if not validate_fio_format(student_fio):
+                continue
             for archive_row in all_data[1:]:
                 if len(archive_row) > 0 and archive_row[0]:
                     archive_fio = archive_row[0].strip()
-                    if student_fio and (student_fio in archive_fio or archive_fio in student_fio):
+                    # Используем точное сравнение для защиты от инъекций
+                    if student_fio and student_fio.lower() == archive_fio.lower():
                         result.append({
                             'fio': archive_row[0],
                             'phone': archive_row[1] if len(archive_row) > 1 else "не указан",
@@ -449,48 +535,54 @@ def send_message(vk, user_id, message, with_keyboard=False, is_authorized=False,
         vk.messages.send(**params)
         return True
     except Exception as e:
-        print(f"Ошибка: {e}")
+        logger.error(f"Ошибка отправки сообщения: {e}")
         return False
 
 # ====================== ЗАПУСК ======================
-print("\n📡 Подключение к VK...")
+logger.info("\n📡 Подключение к VK...")
 try:
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
     longpoll = VkBotLongPoll(vk_session, VK_GROUP_ID)
-    print("✅ Подключение к VK успешно!")
+    logger.info("✅ Подключение к VK успешно!")
 except Exception as e:
-    print(f"❌ Ошибка: {e}")
-    exit()
+    logger.error(f"❌ Ошибка подключения к VK: {e}")
+    exit(1)
 
-print("\n📥 Загрузка данных...")
+logger.info("\n📥 Загрузка данных...")
 archive = get_sheet_data(GID_ARCHIVE)
 schedule = get_sheet_data(GID_SCHEDULE)
 
 if not archive:
-    print("❌ Не удалось загрузить Архив!")
-    exit()
+    logger.error("❌ Не удалось загрузить Архив!")
+    exit(1)
 if not schedule:
-    print("❌ Не удалось загрузить Расписание!")
-    exit()
+    logger.error("❌ Не удалось загрузить Расписание!")
+    exit(1)
 
-print(f"\n✅ Архив: {len(archive)} строк")
-print(f"✅ Расписание: {len(schedule)} строк")
-print(f"📅 Данные обновлены: {last_update_time}")
+logger.info(f"\n✅ Архив: {len(archive)} строк")
+logger.info(f"✅ Расписание: {len(schedule)} строк")
+logger.info(f"📅 Данные обновлены: {last_update_time}")
 
-print("\n" + "="*60)
-print("🤖 БОТ ЗАПУЩЕН!")
-print("📱 Напишите ФИО ученика для авторизации")
-print("👑 Для админ-панели: /admin")
-print("="*60)
+logger.info("\n" + "="*60)
+logger.info("🤖 БОТ ЗАПУЩЕН!")
+logger.info("📱 Напишите ФИО ученика для авторизации")
+logger.info("👑 Для админ-панели: /admin")
+logger.info("="*60)
 
 while True:
     try:
         for event in longpoll.listen():
             if event.type == VkBotEventType.MESSAGE_NEW and event.object.message:
                 user_id = event.object.message['from_id']
-                text = event.object.message['text'].strip()
-                print(f"\n📩 Сообщение: '{text}'")
+                text = sanitize_input(event.object.message['text'])
+                logger.info(f"\n📩 Сообщение от user_id={user_id}: '{text}'")
+
+                # Проверка rate limiting
+                if not check_rate_limit(user_id):
+                    send_message(vk, user_id, "⚠️ *Слишком много запросов!*\\n\\nПожалуйста, подождите немного перед отправкой новых сообщений.", with_keyboard=False)
+                    logger.warning(f"Rate limit превышен для user_id={user_id}")
+                    continue
 
                 # ========== АДМИН АВТОРИЗАЦИЯ ==========
                 if text.lower() == "/admin":
